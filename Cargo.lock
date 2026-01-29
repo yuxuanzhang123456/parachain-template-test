@@ -8667,6 +8667,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-digital-credential"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "parity-scale-codec",
+ "polkadot-sdk 2503.0.1",
+ "polkadot-sdk-frame",
+ "scale-info",
+]
+
+[[package]]
 name = "pallet-election-provider-multi-phase"
 version = "39.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9847,6 +9858,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-use-storage"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "polkadot-sdk-frame",
+ "scale-info",
+]
+
+[[package]]
 name = "pallet-utility"
 version = "40.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10014,7 +10034,9 @@ dependencies = [
  "docify",
  "hex-literal",
  "log",
+ "pallet-digital-credential",
  "pallet-parachain-template",
+ "pallet-use-storage",
  "parity-scale-codec",
  "polkadot-sdk 2503.0.1",
  "scale-info",

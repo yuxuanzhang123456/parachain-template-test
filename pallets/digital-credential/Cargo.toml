@@ -1,0 +1,33 @@
+[package]
+name = "pallet-digital-credential"
+description = "Generate identity credentials for all accounts."
+version = "0.1.0"
+license = "Unlicense"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+# 基础编解码（从工作区继承）
+codec = { workspace = true, features = ["derive"] }
+scale-info = { workspace = true, features = ["derive"] }
+
+# 框架基础（从工作区继承）
+frame = { workspace = true, features = ["runtime"] }
+log = { workspace = true }
+
+# --- 关键修改：直接引用 polkadot-sdk 大包，并开启签名和运行时必需的功能 ---
+# 我们不再通过 workspace 引用 sp-core，而是直接从大包里拿
+polkadot-sdk = { version = "2503.0.1", default-features = false, features = ["sp-core", "sp-runtime"] }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "scale-info/std",
+    "frame/std",
+    "polkadot-sdk/std",
+    "log/std",
+]

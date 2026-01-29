@@ -9,7 +9,7 @@ edition = "2021"
 default-members = ["pallets/template", "runtime"]
 members = [
     "node",
-    "pallets/template",
+    "pallets/*", 
     "runtime",
 ]
 resolver = "2"
