@@ -18,9 +18,17 @@ scale-info = { workspace = true, features = ["derive"] }
 frame = { workspace = true, features = ["runtime"] }
 log = { workspace = true }
 
+# 这里是关键：显式添加缺少的依赖，通常 template 的 workspace 已经定义了这些
+# 我们使用与大多数 template 兼容的 polkadot-v1.1.0 分支
+# frame-support = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "polkadot-v1.1.0", default-features = false }
+# frame-system = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "polkadot-v1.1.0", default-features = false }
+# sp-runtime = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "polkadot-v1.1.0", default-features = false }
+# pallet-timestamp = { git = "https://github.com/paritytech/polkadot-sdk.git", branch = "polkadot-v1.1.0", default-features = false }
+# log = { workspace = true }
+
 # --- 关键修改：直接引用 polkadot-sdk 大包，并开启签名和运行时必需的功能 ---
 # 我们不再通过 workspace 引用 sp-core，而是直接从大包里拿
-polkadot-sdk = { version = "2503.0.1", default-features = false, features = ["sp-core", "sp-runtime"] }
+polkadot-sdk = { version = "2503.0.1", default-features = false, features = ["sp-core", "sp-runtime", "frame-support", "frame-system", "pallet-timestamp"] }
 
 [features]
 default = ["std"]
@@ -30,4 +38,8 @@ std = [
     "frame/std",
     "polkadot-sdk/std",
     "log/std",
+    # "frame-support/std",
+    # "frame-system/std",
+    # "sp-runtime/std",
+    # "pallet-timestamp/std",
 ]
