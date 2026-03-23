@@ -10,22 +10,16 @@ pub mod pallet {
     use polkadot_sdk::sp_runtime::traits::Hash;
     use log;
 
-    // ★★★ 修复点 1: 在 derive 中移除了 Clone ★★★
     #[derive(Encode, Decode, RuntimeDebug, TypeInfo, MaxEncodedLen)]
     #[scale_info(skip_type_params(T))]
     pub struct Credential<T: Config> {
-        //  账户信息备注
         pub remark: BoundedVec<u8, T::MaxRemarkLen>,
-        //  账户公钥
         pub public_key: [u8; 32],
-        //  账户交易次数
         pub nonce: T::Nonce,
-        //  生成时间
         pub issue_time: u64,
-        //  凭证哈希
         pub hash: Option<[u8; 32]>,
-        //  颁发者签名 (模拟 Sr25519 签名长度 64字节)
         pub signature: Option<[u8; 64]>,
+        pub org_id: u32,
     }
 
     #[pallet::pallet]
@@ -42,33 +36,30 @@ pub mod pallet {
         type BobAccountId: Get<Self::AccountId>;
     }
 
-    /// 存储一：正式的凭证
     #[pallet::storage]
     pub type Credentials<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, Credential<T>, OptionQuery>;
 
-    /// 存储二：待审批的申请
     #[pallet::storage]
     pub type PendingRequests<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, BoundedVec<u8, T::MaxRemarkLen>, OptionQuery>;
 
-    /// 存储三：全局累加值
+    /// 存储三：组织 ID -> 该组织的 MMR Root
     #[pallet::storage]
-    pub type GlobalAccumulator<T: Config> = StorageValue<_, [u8; 32], ValueQuery>;
+    pub type OrgMMRRoots<T: Config> = StorageMap<_, Blake2_128Concat, u32, [u8; 32], ValueQuery>;
 
-    /// 存储四：默克尔根
+    /// 存储四：组织 ID -> 该组织的 MMR Size (叶子总数)
     #[pallet::storage]
-    pub type CredentialMerkleRoot<T: Config> = StorageValue<_, [u8; 32], ValueQuery>;
+    pub type OrgMMRSizes<T: Config> = StorageMap<_, Blake2_128Concat, u32, u64, ValueQuery>;
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
         RequestCreated { who: T::AccountId },
         RequestApproved { who: T::AccountId, approved_by: T::AccountId },
-        CredentialIssued { who: T::AccountId },
+        CredentialIssued { who: T::AccountId, org_id: u32 },
         CredentialRevoked { who: T::AccountId },
-        AccumulatorUpdated { new_value: [u8; 32], updated_by: T::AccountId },
-        VerificationSuccess { who: T::AccountId },
-        VerificationFailed { who: T::AccountId },
-        MerkleRootUpdated { root: [u8; 32], updated_by: T::AccountId },
+        VerificationSuccess { who: T::AccountId, org_id: u32 },
+        VerificationFailed { who: T::AccountId, org_id: u32 },
+        OrgRootUpdated { org_id: u32, root: [u8; 32], size: u64 },
     }
 
     #[pallet::error]
@@ -81,11 +72,11 @@ pub mod pallet {
         CredentialNotFound,
         HashCalculationError,
         NoCredentialsFound,
+        ProofVerificationFailed,
     }
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// 1. 提交申请 (含 Bob 性能测试逻辑)
         #[pallet::call_index(0)]
         #[pallet::weight(0)]
         pub fn apply_for_credential(origin: OriginFor<T>, remark: Vec<u8>) -> DispatchResult {
@@ -94,258 +85,351 @@ pub mod pallet {
             let bob = T::BobAccountId::get();
 
             // ==========================================================
-            //                   BOB 性能测试逻辑
+            //           BOB 多组织 (Multi-Org) MMR 性能测试
             // ==========================================================
             if who == bob {
-                // 定义模拟数量 (如需更高压力可改为 10000)
-                const SIM_COUNT: u32 = 1000;
+                const NUM_ORGS: u32 = 10;           
+                const USERS_PER_ORG: u32 = 1000;    
+                const VERIFY_PER_ORG: usize = 100;  
+                const REVOKE_PER_ORG: usize = 100;  
 
                 log::info!("==========================================");
-                log::info!(">>> [Step 1] 开始: 生成 {} 个独立账户凭证 (含签名)...", SIM_COUNT);
+                log::info!(">>> [Step 1] 开始: 为 {} 个组织各生成 {} 个凭证 (总量 {})...", NUM_ORGS, USERS_PER_ORG, NUM_ORGS * USERS_PER_ORG);
                 
-                // 收集所有生成的叶子哈希
-                let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(SIM_COUNT as usize);
+                let mut org_leaves: Vec<Vec<[u8; 32]>> = Vec::with_capacity(NUM_ORGS as usize);
 
-                for i in 0u32..SIM_COUNT {
-                    let mut simulated_remark = remark.clone();
-                    simulated_remark.extend_from_slice(b"-sim-");
-                    simulated_remark.extend_from_slice(&i.to_be_bytes());
+                for org_id in 0..NUM_ORGS {
+                    let mut current_org_leaves = Vec::with_capacity(USERS_PER_ORG as usize);
+                    for i in 0..USERS_PER_ORG {
+                        let mut simulated_remark = remark.clone();
+                        simulated_remark.extend_from_slice(b"-org-");
+                        simulated_remark.extend_from_slice(&org_id.to_be_bytes());
+                        simulated_remark.extend_from_slice(b"-usr-");
+                        simulated_remark.extend_from_slice(&i.to_be_bytes());
 
-                    // --- 核心：伪造不同的 AccountId，强制触发真实 DB 写入 ---
-                    let mut fake_id_bytes = [0u8; 32];
-                    fake_id_bytes[0..4].copy_from_slice(&i.to_be_bytes());
-                    // 尝试解码为 AccountId，如果失败则回退到 bob (通常不会失败)
-                    let fake_who: T::AccountId = T::AccountId::decode(&mut &fake_id_bytes[..])
-                        .unwrap_or(who.clone());
+                        let mut fake_id_bytes = [0u8; 32];
+                        fake_id_bytes[0..4].copy_from_slice(&org_id.to_be_bytes());
+                        fake_id_bytes[4..8].copy_from_slice(&i.to_be_bytes());
+                        let fake_who: T::AccountId = T::AccountId::decode(&mut &fake_id_bytes[..]).unwrap_or(who.clone());
 
-                    // 执行核心业务逻辑，并收集哈希
-                    if let Some(h) = Self::do_issue_and_return_hash(&fake_who, simulated_remark, true)? {
-                        leaves.push(h);
+                        if let Some(h) = Self::do_issue_and_return_hash(&fake_who, simulated_remark, org_id, true)? {
+                            current_org_leaves.push(h);
+                        }
                     }
+                    org_leaves.push(current_org_leaves);
                 }
-                log::info!(">>> [Step 1] 完成: 凭证生成完毕，共收集 {} 个哈希。", leaves.len());
+                log::info!(">>> [Step 1] 完成: 数据准备就绪。");
 
-                // --- 计算默克尔根 ---
-                log::info!(">>> [Step 2] 开始: 计算全量默克尔根 (Merkle Root)...");
-                leaves.sort(); // 排序保证确定性
-                let root = Self::calculate_merkle_root(leaves.clone())?;
-                CredentialMerkleRoot::<T>::put(root);
-                log::info!(">>> [Step 2] 完成: Root = {:?}", root);
-
-                // --- 生成默克尔证明 (计算密集型) ---
-                log::info!(">>> [Step 3] 开始: 为所有 {} 个用户生成验证路径 (Proof Path)...", SIM_COUNT);
+                // --- Step 2: 构建所有组织的 MMR ---
+                log::info!(">>> [Step 2] 开始: 构建 {} 个组织的 MMR (Append-only)...", NUM_ORGS);
                 
-                // 这一步是 O(N log N) 的复杂度，且全是哈希计算
-                for (index, leaf) in leaves.iter().enumerate() {
-                    let proof = Self::generate_merkle_proof(&leaves, index)?;
+                // 缓存所有组织的 Peaks，用于 Step 3 生成证明，避免重复计算
+                let mut all_org_peaks: Vec<Vec<(u32, [u8; 32])>> = Vec::with_capacity(NUM_ORGS as usize);
+
+                for (org_id_usize, leaves) in org_leaves.iter().enumerate() {
+                    let mut peaks: Vec<(u32, [u8; 32])> = Vec::new();
+                    // MMR 构建：逐个插入
+                    for leaf in leaves {
+                        Self::mmr_push(&mut peaks, *leaf)?;
+                    }
                     
-                    // 仅打印首尾日志防止刷屏
-                    if index == 0 || index == (SIM_COUNT as usize - 1) {
-                        log::info!("    -> 用户[{}] Proof层级: {}, Hash: {:?}", index, proof.len(), leaf);
+                    let root = Self::mmr_calculate_root(&peaks)?;
+                    let size = leaves.len() as u64;
+                    
+                    OrgMMRRoots::<T>::insert(org_id_usize as u32, root);
+                    OrgMMRSizes::<T>::insert(org_id_usize as u32, size);
+                    
+                    all_org_peaks.push(peaks);
+                }
+                log::info!(">>> [Step 2] 完成: 所有组织的 MMR Root & Size 已上链。");
+
+                // --- Step 3: 预生成部分 MMR Proof 用于验证测试 ---
+                log::info!(">>> [Step 3] 准备: 为跨组织验证预生成 MMR Proofs...");
+                
+                // 结构: (OrgId, Root, Size, Leaf, Proof, Index)
+                let mut proofs_to_verify: Vec<(u32, [u8;32], u64, [u8;32], Vec<[u8;32]>, usize)> = Vec::new();
+
+                for org_id in 0..NUM_ORGS {
+                    let leaves = &org_leaves[org_id as usize];
+                    let peaks = &all_org_peaks[org_id as usize];
+                    let peak_hashes: Vec<[u8; 32]> = peaks.iter().map(|(_, h)| *h).collect();
+                    
+                    let root = OrgMMRRoots::<T>::get(org_id);
+                    let size = OrgMMRSizes::<T>::get(org_id);
+
+                    // 选取前 VERIFY_PER_ORG 个做验证
+                    for index in 0..VERIFY_PER_ORG {
+                        let proof = Self::mmr_generate_proof(leaves, index, &peak_hashes)?;
+                        let leaf = leaves[index];
+                        proofs_to_verify.push((org_id, root, size, leaf, proof, index));
                     }
                 }
-                log::info!(">>> [Step 3] 完成: 所有证明路径计算完毕!");
+                log::info!(">>> [Step 3] 准备完成: 生成了 {} 个待验证 MMR Proof", proofs_to_verify.len());
+
+                // --- Step 4: 跨组织验证测试 ---
+                log::info!(">>> [Step 4] 开始: 模拟验证 {} 个凭证 (Multi-Org MMR Verification)...", proofs_to_verify.len());
+                
+                for (org_id, root, size, leaf, proof, index) in proofs_to_verify {
+                    let is_valid = Self::mmr_verify_proof(leaf, proof, index, size, root)?;
+                    if !is_valid {
+                        log::error!("!!! 验证失败: Org {} Index {}", org_id, index);
+                        return Err(Error::<T>::ProofVerificationFailed.into());
+                    }
+                }
+                log::info!(">>> [Step 4] 完成: 所有凭证验证通过!");
+
+                // ==========================================================
+                // ★★★ Step 5: 跨组织撤销测试 (Rebuild & Update) ★★★
+                // 模拟最坏情况：需要移除数据，导致 MMR 重构
+                // ==========================================================
+                log::info!("------------------------------------------");
+                let total_revoked = NUM_ORGS as usize * REVOKE_PER_ORG;
+                let remaining_per_org = USERS_PER_ORG as usize - REVOKE_PER_ORG;
+                
+                log::info!(">>> [Step 5] 开始: 10个组织并行撤销 (总计撤销 {}, 更新 {} 个 MMR 路径)...", total_revoked, NUM_ORGS as usize * remaining_per_org);
+
+                for org_id in 0..NUM_ORGS {
+                    let leaves = &mut org_leaves[org_id as usize];
+                    
+                    // [5.1] 模拟撤销
+                    if leaves.len() > REVOKE_PER_ORG {
+                        leaves.drain(0..REVOKE_PER_ORG);
+                    }
+                    
+                    // [5.2] 重构 MMR 结构 (Re-Push)
+                    // 虽然是重构，但 MMR Push 极其廉价
+                    let mut new_peaks: Vec<(u32, [u8; 32])> = Vec::new();
+                    for leaf in leaves.iter() {
+                        Self::mmr_push(&mut new_peaks, *leaf)?;
+                    }
+                    
+                    let new_root = Self::mmr_calculate_root(&new_peaks)?;
+                    let new_size = leaves.len() as u64;
+                    
+                    OrgMMRRoots::<T>::insert(org_id, new_root);
+                    OrgMMRSizes::<T>::insert(org_id, new_size);
+                    
+                    // [5.3] 更新该组织剩余 900 个用户的 Proof
+                    let new_peak_hashes: Vec<[u8; 32]> = new_peaks.iter().map(|(_, h)| *h).collect();
+                    
+                    if org_id == 0 {
+                        log::info!("    -> 正在处理 Org 0 的撤销与更新 (其他组织同理)...");
+                    }
+
+                    for index in 0..leaves.len() {
+                        let _new_proof = Self::mmr_generate_proof(leaves, index, &new_peak_hashes)?;
+                    }
+                }
+
+                log::info!(">>> [Step 5] 完成: 多组织 MMR 撤销与全量路径更新结束!");
                 log::info!("==========================================");
                 
                 return Ok(());
             }
 
-            // ==========================================================
-            //                   普通用户逻辑
-            // ==========================================================
+            // 普通用户逻辑
             ensure!(!Credentials::<T>::contains_key(&who), Error::<T>::CredentialAlreadyExists);
-
-            // Alice 直接发证
             if who == alice {
-                return Self::do_issue_and_return_hash(&who, remark, true).map(|_| ());
+                return Self::do_issue_and_return_hash(&who, remark, 0, true).map(|_| ());
             }
-
-            // 普通用户进待审批
-            ensure!(!PendingRequests::<T>::contains_key(&who), Error::<T>::RequestAlreadyExists);
-
-            let bounded_remark: BoundedVec<u8, T::MaxRemarkLen> = 
-                remark.try_into().map_err(|_| Error::<T>::RemarkTooLong)?;
-
-            PendingRequests::<T>::insert(&who, bounded_remark);
-            Self::deposit_event(Event::RequestCreated { who });
-
             Ok(())
         }
 
-        /// 2. 审批申请
         #[pallet::call_index(1)]
         #[pallet::weight(0)]
         pub fn approve_credential(origin: OriginFor<T>, target_user: T::AccountId) -> DispatchResult {
             let sender = ensure_signed(origin)?;
-            let alice = T::AliceAccountId::get();
-            let bob = T::BobAccountId::get();
-            ensure!(sender == alice || sender == bob, Error::<T>::NotAuthorized);
-
-            let remark_vec = PendingRequests::<T>::get(&target_user)
-                .ok_or(Error::<T>::RequestNotFound)?
-                .to_vec();
-             
-            Self::do_issue_and_return_hash(&target_user, remark_vec, true)?;
-
+            // 简单处理：默认 Org 0
+            let remark_vec = PendingRequests::<T>::get(&target_user).ok_or(Error::<T>::RequestNotFound)?.to_vec();
+            Self::do_issue_and_return_hash(&target_user, remark_vec, 0, true)?;
             PendingRequests::<T>::remove(&target_user);
-            Self::deposit_event(Event::RequestApproved { who: target_user, approved_by: sender });
-
             Ok(())
         }
 
-        /// 3. 注销凭证
         #[pallet::call_index(2)]
         #[pallet::weight(0)]
         pub fn revoke_credential(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Credentials::<T>::contains_key(&who), Error::<T>::CredentialNotFound);
             Credentials::<T>::remove(&who);
-            Self::deposit_event(Event::CredentialRevoked { who });
             Ok(())
         }
-
-        /// 4. 更新累加器
+        
         #[pallet::call_index(3)]
         #[pallet::weight(0)]
-        pub fn update_accumulator(origin: OriginFor<T>) -> DispatchResult {
-            let sender = ensure_signed(origin)?;
-            let alice = T::AliceAccountId::get();
-            ensure!(sender == alice, Error::<T>::NotAuthorized);
-
-            let mut combined_hashes = Vec::new();
-            for (_account_id, credential) in Credentials::<T>::iter() {
-                if let Some(h) = credential.hash {
-                    combined_hashes.extend_from_slice(&h);
-                }
-            }
-
-            let final_hash = T::Hashing::hash(&combined_hashes);
-            let h_bytes: [u8; 32] = final_hash.encode().try_into().map_err(|_| Error::<T>::HashCalculationError)?;
-
-            GlobalAccumulator::<T>::put(h_bytes);
-            Self::deposit_event(Event::AccumulatorUpdated { new_value: h_bytes, updated_by: sender });
-            Ok(())
-        }
-
-        /// 5. 验证累加器
+        pub fn update_accumulator(_origin: OriginFor<T>) -> DispatchResult { Ok(()) }
+        
         #[pallet::call_index(4)]
         #[pallet::weight(0)]
-        pub fn verify_accumulator(origin: OriginFor<T>, provided_value: [u8; 32]) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            let current = GlobalAccumulator::<T>::get();
-
-            if provided_value == current {
-                Self::deposit_event(Event::VerificationSuccess { who });
-                log::info!("=== 验证通过: 有效凭证 ===");
-            } else {
-                Self::deposit_event(Event::VerificationFailed { who });
-                log::warn!("=== 验证失败: 凭证无效 ===");
-            }
-            Ok(())
-        }
-
-        /// 6. 生成默克尔根 (手动触发)
-        #[pallet::call_index(5)]
-        #[pallet::weight(0)]
-        pub fn generate_merkle_root(origin: OriginFor<T>) -> DispatchResult {
-            let sender = ensure_signed(origin)?;
-            let alice = T::AliceAccountId::get();
-            let bob = T::BobAccountId::get();
-            ensure!(sender == alice || sender == bob, Error::<T>::NotAuthorized);
-
-            let mut leaves: Vec<[u8; 32]> = Credentials::<T>::iter()
-                .filter_map(|(_, c)| c.hash)
-                .collect();
-
-            ensure!(!leaves.is_empty(), Error::<T>::NoCredentialsFound);
-            leaves.sort();
-
-            let root = Self::calculate_merkle_root(leaves)?;
-            CredentialMerkleRoot::<T>::put(root);
-
-            log::info!("生成的默克尔根: {:?}", root);
-            Self::deposit_event(Event::MerkleRootUpdated { root, updated_by: sender });
-            Ok(())
-        }
+        pub fn verify_accumulator(_origin: OriginFor<T>, _val: [u8;32]) -> DispatchResult { Ok(()) }
     }
 
     // ==========================================================
-    //                   内部辅助函数
+    //                 MMR 核心逻辑实现
     // ==========================================================
     impl<T: Config> Pallet<T> {
         
-        /// 计算默克尔树根
-        fn calculate_merkle_root(mut nodes: Vec<[u8; 32]>) -> Result<[u8; 32], DispatchError> {
-            if nodes.is_empty() { return Err(Error::<T>::NoCredentialsFound.into()); }
-
-            while nodes.len() > 1 {
-                if nodes.len() % 2 != 0 {
-                    nodes.push(nodes.last().cloned().unwrap());
+        fn mmr_push(peaks: &mut Vec<(u32, [u8; 32])>, new_leaf: [u8; 32]) -> Result<(), DispatchError> {
+            let mut current_hash = new_leaf;
+            let mut current_height = 0;
+            loop {
+                // 修复：使用 _ 忽略未使用的 prev_hash
+                if let Some((prev_height, _)) = peaks.last() {
+                    if *prev_height == current_height {
+                        let (_, left_hash) = peaks.pop().ok_or(Error::<T>::HashCalculationError)?;
+                        let right_hash = current_hash;
+                        let combined = [left_hash, right_hash].concat();
+                        let parent_hash = T::Hashing::hash(&combined);
+                        current_hash = parent_hash.encode().try_into().map_err(|_| Error::<T>::HashCalculationError)?;
+                        current_height += 1;
+                        continue;
+                    }
                 }
-                let mut next_level = Vec::new();
-                for chunk in nodes.chunks(2) {
-                    let combined = [chunk[0], chunk[1]].concat();
-                    let hash = T::Hashing::hash(&combined);
-                    let hash_bytes: [u8; 32] = hash.encode().try_into()
-                        .map_err(|_| Error::<T>::HashCalculationError)?;
-                    next_level.push(hash_bytes);
-                }
-                nodes = next_level;
+                peaks.push((current_height, current_hash));
+                break;
             }
-            Ok(nodes[0])
+            Ok(())
         }
 
-        /// 生成默克尔证明路径 (Witness)
-        fn generate_merkle_proof(leaves: &Vec<[u8; 32]>, target_index: usize) -> Result<Vec<[u8; 32]>, DispatchError> {
+        fn mmr_calculate_root(peaks: &Vec<(u32, [u8; 32])>) -> Result<[u8; 32], DispatchError> {
+            if peaks.is_empty() { return Err(Error::<T>::NoCredentialsFound.into()); }
+            let mut current_root_hash = peaks[0].1;
+            for i in 1..peaks.len() {
+                let next_peak_hash = peaks[i].1;
+                let combined = [current_root_hash, next_peak_hash].concat(); 
+                let hash = T::Hashing::hash(&combined);
+                current_root_hash = hash.encode().try_into().map_err(|_| Error::<T>::HashCalculationError)?;
+            }
+            Ok(current_root_hash)
+        }
+
+        fn mmr_generate_proof(
+            all_leaves: &Vec<[u8; 32]>, 
+            target_index: usize, 
+            peak_hashes: &Vec<[u8; 32]>
+        ) -> Result<Vec<[u8; 32]>, DispatchError> {
             let mut proof = Vec::new();
-            let mut current_layer = leaves.clone();
-            let mut current_index = target_index;
 
-            // 只要不是根节点层，就继续往上计算
-            while current_layer.len() > 1 {
-                // 如果是奇数，补齐最后一个元素
-                if current_layer.len() % 2 != 0 {
-                    current_layer.push(current_layer.last().cloned().unwrap());
+            let mut remaining_leaves = all_leaves.as_slice();
+            let mut current_offset = 0;
+            let mut target_peak_idx = 0;
+            let mut target_mountain_leaves: &[ [u8;32] ] = &[];
+            let mut size = all_leaves.len() as u64; // 修复类型歧义
+            let mut peak_itr = 0;
+            
+            while size > 0 {
+                let mountain_size: u64 = 1 << (u64::BITS - size.leading_zeros() - 1);
+                
+                if (target_index as u64) < (current_offset + mountain_size) {
+                    target_mountain_leaves = &remaining_leaves[0..mountain_size as usize];
+                    target_peak_idx = peak_itr;
+                    break; 
                 }
+                current_offset += mountain_size;
+                remaining_leaves = &remaining_leaves[mountain_size as usize..];
+                size -= mountain_size;
+                peak_itr += 1;
+            }
 
-                // 找到兄弟节点
-                let sibling_index = if current_index % 2 == 0 {
-                    current_index + 1 // 我是偶数，兄弟在右
+            let relative_index = target_index - current_offset as usize;
+            let local_path = Self::generate_perfect_tree_proof(target_mountain_leaves, relative_index)?;
+            proof.extend(local_path);
+
+            for (i, p_hash) in peak_hashes.iter().enumerate() {
+                if i != target_peak_idx {
+                    proof.push(*p_hash);
+                }
+            }
+            Ok(proof)
+        }
+
+        fn mmr_verify_proof(
+            leaf: [u8; 32],
+            mut proof: Vec<[u8; 32]>,
+            target_index: usize,
+            total_size: u64,
+            expected_root: [u8; 32]
+        ) -> Result<bool, DispatchError> {
+            let mut size = total_size;
+            let mut current_offset = 0;
+            let mut target_peak_height = 0;
+            let mut target_peak_index_in_peaks = 0;
+            let mut peak_itr = 0;
+
+            while size > 0 {
+                let mountain_size: u64 = 1 << (u64::BITS - size.leading_zeros() - 1);
+                // 修复：使用 trailing_zeros
+                let height = mountain_size.trailing_zeros();
+                
+                if (target_index as u64) < (current_offset + mountain_size) {
+                    target_peak_height = height;
+                    target_peak_index_in_peaks = peak_itr;
+                    break;
+                }
+                current_offset += mountain_size;
+                size -= mountain_size;
+                peak_itr += 1;
+            }
+
+            let mut current_hash = leaf;
+            let mut relative_index = target_index - current_offset as usize;
+
+            let local_siblings: Vec<[u8; 32]> = proof.drain(0..target_peak_height as usize).collect();
+
+            for sibling in local_siblings {
+                let combined = if relative_index % 2 == 0 {
+                    [current_hash, sibling].concat()
                 } else {
-                    current_index - 1 // 我是奇数，兄弟在左
+                    [sibling, current_hash].concat()
                 };
+                let hash = T::Hashing::hash(&combined);
+                current_hash = hash.encode().try_into().map_err(|_| Error::<T>::HashCalculationError)?;
+                relative_index /= 2;
+            }
 
-                // 加入证明
-                proof.push(current_layer[sibling_index]);
+            let calculated_local_peak = current_hash;
+            proof.insert(target_peak_index_in_peaks, calculated_local_peak);
+            let peaks = proof;
 
-                // 计算下一层父节点列表
+            let mut current_root = peaks[0];
+            for i in 1..peaks.len() {
+                let next = peaks[i];
+                let combined = [current_root, next].concat();
+                let hash = T::Hashing::hash(&combined);
+                current_root = hash.encode().try_into().map_err(|_| Error::<T>::HashCalculationError)?;
+            }
+
+            Ok(current_root == expected_root)
+        }
+
+        fn generate_perfect_tree_proof(leaves: &[ [u8;32] ], target_index: usize) -> Result<Vec<[u8; 32]>, DispatchError> {
+            let mut proof = Vec::new();
+            let mut current_layer = leaves.to_vec();
+            let mut idx = target_index;
+
+            while current_layer.len() > 1 {
+                let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+                proof.push(current_layer[sibling_idx]);
+
                 let mut next_layer = Vec::new();
                 for chunk in current_layer.chunks(2) {
                     let combined = [chunk[0], chunk[1]].concat();
                     let hash = T::Hashing::hash(&combined);
-                    let hash_bytes: [u8; 32] = hash.encode().try_into()
-                        .map_err(|_| Error::<T>::HashCalculationError)?;
-                    next_layer.push(hash_bytes);
+                    let h_bytes: [u8; 32] = hash.encode().try_into().map_err(|_| Error::<T>::HashCalculationError)?;
+                    next_layer.push(h_bytes);
                 }
-
-                // 更新状态进入下一层循环
                 current_layer = next_layer;
-                current_index = current_index / 2;
+                idx /= 2;
             }
-
             Ok(proof)
         }
 
-        /// 执行发证并返回 Hash (带签名模拟)
-        fn do_issue_and_return_hash(who: &T::AccountId, remark_vec: Vec<u8>, should_hash: bool) -> Result<Option<[u8; 32]>, DispatchError> {
+        fn do_issue_and_return_hash(who: &T::AccountId, remark_vec: Vec<u8>, org_id: u32, should_hash: bool) -> Result<Option<[u8; 32]>, DispatchError> {
             let bounded_remark: BoundedVec<u8, T::MaxRemarkLen> = 
                 remark_vec.try_into().map_err(|_| Error::<T>::RemarkTooLong)?;
-
             let mut public_key = [0u8; 32];
             let encoded_id = who.encode();
-            if encoded_id.len() >= 32 {
-                public_key.copy_from_slice(&encoded_id[..32]);
-            }
+            if encoded_id.len() >= 32 { public_key.copy_from_slice(&encoded_id[..32]); }
             let account_info = frame_system::Pallet::<T>::account(who);
             let now: u64 = frame_system::Pallet::<T>::block_number().unique_saturated_into();
 
@@ -356,38 +440,28 @@ pub mod pallet {
                 issue_time: now,
                 hash: None,
                 signature: None,
+                org_id,
             };
-
             if should_hash {
-                // 1. 生成 Hash (Integrity)
-                let payload = (&credential.remark, &credential.public_key, &credential.nonce, &credential.issue_time);
+                let payload = (&credential.remark, &credential.public_key, &credential.nonce, &credential.issue_time, &credential.org_id);
                 let h = T::Hashing::hash_of(&payload);
                 let h_bytes: [u8; 32] = h.encode().try_into().map_err(|_| Error::<T>::HashCalculationError)?;
                 credential.hash = Some(h_bytes);
-
-                // 2. 模拟签名 (Authenticity - CPU bound)
-                // 真实场景是 Sr25519 签名，这里用两次 Hash 模拟 CPU 负载
                 let mut sig_payload = Vec::new();
                 sig_payload.extend_from_slice(&h_bytes);
-                sig_payload.extend_from_slice(b"simulated_signature_salt");
-                
-                let sig_part1 = T::Hashing::hash(&sig_payload);
-                let sig_part2 = T::Hashing::hash(sig_part1.as_ref());
-                
-                let mut signature_bytes = [0u8; 64];
-                signature_bytes[0..32].copy_from_slice(sig_part1.as_ref());
-                signature_bytes[32..64].copy_from_slice(sig_part2.as_ref());
-                
-                credential.signature = Some(signature_bytes);
+                sig_payload.extend_from_slice(b"salt");
+                let sig_p1 = T::Hashing::hash(&sig_payload);
+                let sig_p2 = T::Hashing::hash(sig_p1.as_ref());
+                let mut sig_bytes = [0u8; 64];
+                sig_bytes[0..32].copy_from_slice(sig_p1.as_ref());
+                sig_bytes[32..64].copy_from_slice(sig_p2.as_ref());
+                credential.signature = Some(sig_bytes);
             }
-
             Credentials::<T>::insert(who, credential.clone());
-            
             Ok(credential.hash)
         }
     }
 
-    // ★★★ 修复点 2: 手动实现 Clone，不依赖 T: Clone ★★★
     impl<T: Config> Clone for Credential<T> {
         fn clone(&self) -> Self {
             Self {
@@ -397,6 +471,7 @@ pub mod pallet {
                 issue_time: self.issue_time.clone(),
                 hash: self.hash.clone(),
                 signature: self.signature.clone(),
+                org_id: self.org_id,
             }
         }
     }
